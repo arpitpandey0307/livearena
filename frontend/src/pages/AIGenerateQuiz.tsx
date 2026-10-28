@@ -22,11 +22,22 @@ export default function AIGenerateQuiz() {
 
     setLoading(true);
     try {
-      const quiz = await quizApi.generate({
+      const draft = await quizApi.generate({
         topic,
         description: description || undefined,
         difficulty,
         questionCount,
+      });
+
+      // Persist the AI draft so the shared editor can load it by id.
+      // The host still reviews/edits before hosting a live session.
+      const quiz = await quizApi.create({
+        title: draft.title,
+        description: draft.description,
+        source: 'ai',
+        difficulty: draft.difficulty,
+        questions: draft.questions,
+        defaultTimeLimitSeconds: draft.defaultTimeLimitSeconds,
       });
 
       // Navigate to editor with generated quiz
