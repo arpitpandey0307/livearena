@@ -7,6 +7,17 @@ const api = axios.create({
   },
 });
 
+api.interceptors.response.use(
+  (response) => response,
+  (error) => {
+    const customMessage = error.response?.data?.error?.message;
+    if (customMessage) {
+      error.message = customMessage;
+    }
+    return Promise.reject(error);
+  }
+);
+
 // Response type wrapper
 export interface ApiResponse<T> {
   data: T | null;

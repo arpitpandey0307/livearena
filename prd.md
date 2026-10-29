@@ -6,7 +6,7 @@
 **Target Release:** One-week MVP for college continuous assessment  
 **Primary Goal:** Demonstrate a polished, AI-powered, real-time multiplayer quiz platform using MongoDB.
 
----
+--- 
 
 ## 1. Product Overview
 

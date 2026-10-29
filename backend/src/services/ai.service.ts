@@ -12,12 +12,13 @@ interface AIResponse {
 }
 
 /**
- * AI service supporting both Google Gemini (native API) and
- * OpenAI-compatible chat-completions endpoints.
+ * AI service supporting Google Gemini, OpenAI-compatible chat-completions,
+ * and Anthropic Claude Messages API.
  *
  * Selection is driven by env:
  *  - GEMINI_API_KEY (or AI_PROVIDER=gemini) -> Gemini generateContent
- *  - AI_API_KEY + AI_API_URL                 -> OpenAI-compatible chat completions
+ *  - AI_PROVIDER=anthropic or AI_PROVIDER=claude -> Anthropic Messages API
+ *  - AI_API_KEY + AI_API_URL                     -> OpenAI-compatible chat completions
  */
 export class AIService {
   private static get apiKey(): string {
@@ -28,24 +29,35 @@ export class AIService {
     );
   }
 
-  private static get provider(): 'gemini' | 'openai' {
-    if (process.env.AI_PROVIDER === 'openai') return 'openai';
-    if (process.env.AI_PROVIDER === 'gemini') return 'gemini';
+  private static get provider(): 'gemini' | 'openai' | 'anthropic' {
+    const provider = process.env.AI_PROVIDER?.toLowerCase().trim();
+    if (provider === 'gemini') return 'gemini';
+    if (provider === 'anthropic' || provider === 'claude') return 'anthropic';
+    if (provider === 'openai') return 'openai';
     if (process.env.GEMINI_API_KEY) return 'gemini';
-    return 'openai';
+    // Detect Anthropic key format (sk-ant-...)
+    if (this.apiKey.startsWith('sk-ant-')) return 'anthropic';
+    // Detect OpenAI key format (sk-...)
+    if (this.apiKey.startsWith('sk-')) return 'openai';
+    // Default to gemini (Gemini keys commonly start with AIza or AQ.)
+    return 'gemini';
   }
 
   private static get geminiModel(): string {
-    return process.env.AI_MODEL || process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+    const model = process.env.GEMINI_MODEL || process.env.AI_MODEL;
+    if (model && !model.toLowerCase().includes('claude') && !model.toLowerCase().includes('gpt')) {
+      return model;
+    }
+    return 'gemini-2.5-flash';
   }
 
   private static get geminiUrl(): string {
-    const base =
-      process.env.AI_API_URL ||
-      'https://generativelanguage.googleapis.com/v1beta';
-    // If a full model endpoint was supplied, respect it.
-    if (base.includes(':generateContent')) return base;
-    return `${base.replace(/\/$/, '')}/models/${this.geminiModel}:generateContent`;
+    const base = process.env.AI_API_URL?.trim();
+    if (base && base.includes(':generateContent')) return base;
+    const cleanBase = (base && !base.includes('anthropic') && !base.includes('openai'))
+      ? base.replace(/\/$/, '')
+      : 'https://generativelanguage.googleapis.com/v1beta';
+    return `${cleanBase}/models/${this.geminiModel}:generateContent`;
   }
 
   private static get openaiUrl(): string {
@@ -56,6 +68,16 @@ export class AIService {
 
   private static get openaiModel(): string {
     return process.env.AI_MODEL || 'gpt-4';
+  }
+
+  private static get anthropicUrl(): string {
+    return (
+      process.env.AI_API_URL || 'https://api.anthropic.com/v1/messages'
+    );
+  }
+
+  private static get anthropicModel(): string {
+    return process.env.AI_MODEL || 'claude-sonnet-4-20250514';
   }
 
   /**
@@ -71,10 +93,15 @@ export class AIService {
     const prompt = this.buildPrompt(input);
 
     try {
-      const response =
-        this.provider === 'gemini'
-          ? await this.callGemini(prompt)
-          : await this.callOpenAI(prompt);
+      let response: string;
+
+      if (this.provider === 'gemini') {
+        response = await this.callGemini(prompt);
+      } else if (this.provider === 'anthropic') {
+        response = await this.callAnthropic(prompt);
+      } else {
+        response = await this.callOpenAI(prompt);
+      }
 
       const parsed = this.parseAIResponse(response);
       return this.transformQuestions(parsed.questions);
@@ -145,7 +172,20 @@ Important:
       },
     };
 
-    const response = await fetch(this.geminiUrl, {
+    let targetUrl = this.geminiUrl;
+    try {
+      const urlObj = new URL(targetUrl);
+      if (!urlObj.searchParams.has('key') && this.apiKey) {
+        urlObj.searchParams.set('key', this.apiKey);
+      }
+      targetUrl = urlObj.toString();
+    } catch {
+      if (!targetUrl.includes('key=') && this.apiKey) {
+        targetUrl += `${targetUrl.includes('?') ? '&' : '?'}key=${encodeURIComponent(this.apiKey)}`;
+      }
+    }
+
+    let response = await fetch(targetUrl, {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -153,6 +193,19 @@ Important:
       },
       body: JSON.stringify(body),
     });
+
+    // If gemini-2.0-flash returned 404, fallback to gemini-1.5-flash
+    if (response.status === 404 && targetUrl.includes('gemini-2.0-flash')) {
+      const fallbackUrl = targetUrl.replace('gemini-2.0-flash', 'gemini-1.5-flash');
+      response = await fetch(fallbackUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-goog-api-key': this.apiKey,
+        },
+        body: JSON.stringify(body),
+      });
+    }
 
     if (!response.ok) {
       const errorText = await response.text();
@@ -214,20 +267,73 @@ Important:
   }
 
   /**
+   * Call Anthropic Claude Messages API
+   */
+  private static async callAnthropic(prompt: string): Promise<string> {
+    const response = await fetch(this.anthropicUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': this.apiKey,
+        'anthropic-version': '2023-06-01',
+      },
+      body: JSON.stringify({
+        model: this.anthropicModel,
+        max_tokens: 4096,
+        temperature: 0.7,
+        system: 'You are a professional quiz creator. Generate high-quality multiple-choice questions in the exact JSON format requested. Always respond with valid JSON only, no additional text.',
+        messages: [
+          {
+            role: 'user',
+            content: prompt,
+          },
+        ],
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      throw new Error(this.describeProviderError(response.status, errorText));
+    }
+
+    const data: any = await response.json();
+
+    // Anthropic returns content as an array of blocks
+    const textContent = data.content
+      ?.filter((block: any) => block.type === 'text')
+      .map((block: any) => block.text)
+      .join('');
+
+    if (!textContent) {
+      throw new Error('AI provider returned an empty response');
+    }
+
+    return textContent;
+  }
+
+  /**
    * Turn provider errors into user-safe messages.
    * 401/403 -> key problem, 402/429 -> quota/billing
    */
   private static describeProviderError(status: number, raw: string): string {
+    let cleanMessage = '';
+    try {
+      const parsed = JSON.parse(raw);
+      cleanMessage = parsed.error?.message || parsed.message || '';
+    } catch {
+      cleanMessage = raw.slice(0, 200);
+    }
+
     if (status === 401 || status === 403) {
-      return 'AI authentication failed. Check that your GEMINI_API_KEY is valid and enabled for the Generative Language API.';
+      return `AI authentication failed (${status}). Check that your Gemini API key is valid: ${cleanMessage}`;
     }
     if (status === 402 || status === 429) {
-      return 'AI quota exceeded or billing not enabled for this key. Try again later or use manual quiz creation.';
+      return `AI quota exceeded (${status}). Please try again later: ${cleanMessage}`;
     }
     if (status === 404) {
-      return 'AI model not found. Check AI_MODEL / GEMINI_MODEL in backend/.env.';
+      return `AI model not found (${status}). Check AI_MODEL in backend/.env: ${cleanMessage}`;
     }
-    return `AI provider error (${status}): ${raw.slice(0, 300)}`;
+    return `AI provider error (${status}): ${cleanMessage || raw.slice(0, 300)}`;
   }
 
   /**
@@ -237,15 +343,7 @@ Important:
     let jsonStr = response.trim();
 
     // Strip markdown code fences if the model added them
-    if (jsonStr.startsWith('```json')) {
-      jsonStr = jsonStr.slice(7);
-    } else if (jsonStr.startsWith('```')) {
-      jsonStr = jsonStr.slice(3);
-    }
-    if (jsonStr.endsWith('```')) {
-      jsonStr = jsonStr.slice(0, -3);
-    }
-    jsonStr = jsonStr.trim();
+    jsonStr = jsonStr.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
 
     // Fallback: extract the outermost JSON object
     if (!jsonStr.startsWith('{')) {
@@ -276,11 +374,23 @@ Important:
       if (!Array.isArray(q.options) || q.options.length !== 4) {
         throw new Error(`Question ${index + 1} must have exactly 4 options`);
       }
-      if (
-        typeof q.correctAnswer !== 'number' ||
-        q.correctAnswer < 0 ||
-        q.correctAnswer >= q.options.length
-      ) {
+
+      let correctIndex = -1;
+      if (typeof q.correctAnswer === 'number') {
+        correctIndex = q.correctAnswer;
+      } else if (typeof q.correctAnswer === 'string') {
+        const parsed = parseInt(q.correctAnswer, 10);
+        if (!isNaN(parsed)) {
+          correctIndex = parsed;
+        } else {
+          const letter = (q.correctAnswer as string).trim().toUpperCase();
+          if (letter.length === 1 && letter >= 'A' && letter <= 'D') {
+            correctIndex = letter.charCodeAt(0) - 65;
+          }
+        }
+      }
+
+      if (correctIndex < 0 || correctIndex >= q.options.length) {
         throw new Error(`Invalid correctAnswer index for question ${index + 1}`);
       }
 
@@ -291,7 +401,7 @@ Important:
           optionId: String.fromCharCode(97 + optIndex),
           text: opt,
         })),
-        correctOptionId: String.fromCharCode(97 + q.correctAnswer),
+        correctOptionId: String.fromCharCode(97 + correctIndex),
         explanation: q.explanation,
         timeLimitSeconds: 20,
       };
